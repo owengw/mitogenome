@@ -69,6 +69,9 @@ BSP_POP_JSON       = os.path.join(OUTDIR, "bsp",    "bsp_pop_summary.json")
 CODEML_POP_JSON    = os.path.join(OUTDIR, "dnds",   "codeml", "pop_sizes.json")
 ANNOTATION_SUMMARY = os.path.join(OUTDIR, "annotation_test",
                      "test.consensus_mito.fa.result", "summary.txt")
+MISMATCH_JSON      = os.path.join(OUTDIR, "mismatch", "mismatch_summary.json")
+MULTIGENE_DIR      = os.path.join(OUTDIR, "multigene")
+DLOOP_DIR          = os.path.join(OUTDIR, "dloop")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def median(lst):
@@ -499,17 +502,24 @@ if bsp_pop_data:
         pop_sizes = data["pop_sizes"]
         if not pop_sizes: continue
         n_groups = len(pop_sizes[0])
-        import numpy as np
-        ps_arr = np.array(pop_sizes)  # shape: (n_samples, n_groups)
+        ps_arr  = np.array(pop_sizes)  # shape: (n_samples, n_groups)
         medians = np.median(ps_arr, axis=0)
         lo95    = np.percentile(ps_arr, 2.5,  axis=0)
         hi95    = np.percentile(ps_arr, 97.5, axis=0)
         groups  = np.arange(1, n_groups + 1)
         colour  = POP_COLOURS.get(pop_label, "#607D8B")
         try:
+            from scipy.ndimage import gaussian_filter1d
+            # Smooth median line only (not HPD — keep HPD as raw posterior)
+            smooth_med = gaussian_filter1d(np.log10(np.maximum(medians, 1e-9)), sigma=1.5)
+            smooth_med = 10 ** smooth_med
             fig, ax = plt.subplots(figsize=(7, 4))
-            ax.fill_between(groups, lo95, hi95, alpha=0.25, color=colour)
-            ax.plot(groups, medians, color=colour, linewidth=2)
+            ax.fill_between(groups, lo95, hi95, alpha=0.20, color=colour,
+                            label="95% HPD")
+            ax.plot(groups, medians,    color=colour, linewidth=0.8,
+                    alpha=0.4, linestyle="--", label="Median (raw)")
+            ax.plot(groups, smooth_med, color=colour, linewidth=2.0,
+                    label="Median (smoothed)")
             ax.set_yscale("log")
             ax.set_xlabel("Coalescent interval (recent → ancient)", fontsize=10)
             ax.set_ylabel("Effective population size (Ne, log scale)", fontsize=10)
@@ -518,7 +528,10 @@ if bsp_pop_data:
             title_pop = "All samples" if pop_label == "all" else f"Population {pop_label}"
             n_label   = f" (n={n_samples})" if n_samples else ""
             ax.set_title(f"BSP — {title_pop}{n_label}", fontsize=11)
+            ax.legend(fontsize=8, loc="best")
             ax.tick_params(labelsize=9)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
             fig.tight_layout()
             bsp_plots_b64[pop_label] = encode_fig(fig)
             plt.close(fig)
@@ -554,6 +567,48 @@ if bsp_ess_rows:
         print("  BSP ESS figure done")
     except Exception as e:
         print(f"  BSP ESS figure failed: {e}")
+
+
+# ── Figure 11: Mismatch distribution plots ────────────────────────────────────
+print("Generating mismatch distribution figures...")
+mismatch_plots_b64 = {}
+mismatch_data = load_json(MISMATCH_JSON)
+
+if mismatch_data:
+    POP_COLOURS_MM = {"SI":"#3b82f6","NS":"#22c55e","CAI":"#f97316",
+                      "SB":"#a855f7","all":"#94a3b8"}
+    for pop, data in mismatch_data.items():
+        if data.get("skipped"):
+            continue
+        try:
+            x_vals   = data["x_values"]
+            obs_freq = data["observed_freq"]
+            exp_freq = data["expected_freq"]
+            colour   = data.get("colour", POP_COLOURS_MM.get(pop, "#607D8B"))
+
+            fig, ax = plt.subplots(figsize=(7, 4))
+            ax.bar(x_vals, obs_freq, color=colour, alpha=0.6, label="Observed",
+                   width=0.8, edgecolor="none")
+            ax.plot(x_vals[:len(exp_freq)], exp_freq[:len(x_vals)],
+                    color="white", linewidth=2, linestyle="--",
+                    label=f"Expected (sudden expansion, τ={data['tau']:.2f})")
+            ax.set_xlabel("Pairwise differences", fontsize=10)
+            ax.set_ylabel("Frequency", fontsize=10)
+            title_pop = "All populations" if pop == "all" else f"Population {pop}"
+            ax.set_title(
+                f"Mismatch Distribution — {title_pop}  "
+                f"(n={data['n']}, r={data['raggedness']:.4f}, SSD={data['ssd']:.4f})",
+                fontsize=10)
+            ax.legend(fontsize=8)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.tick_params(labelsize=9)
+            fig.tight_layout()
+            mismatch_plots_b64[pop] = encode_fig(fig)
+            plt.close(fig)
+            print(f"  Mismatch plot done for {pop}")
+        except Exception as e:
+            print(f"  Mismatch plot failed for {pop}: {e}")
 
 # ── Build excluded-population banner ─────────────────────────────────────────
 excl_banner = ""
@@ -687,6 +742,46 @@ if IS_FILTERED:
     report_subtitle = f' <span style="background:#FFF8E1;color:#E65100;padding:2px 8px;border-radius:10px;font-size:0.7em;font-weight:bold;">FILTERED (n≥{MIN_POP_SIZE})</span>'
 else:
     report_subtitle = f' <span style="background:#E8F5E9;color:#2E7D32;padding:2px 8px;border-radius:10px;font-size:0.7em;font-weight:bold;">ALL POPULATIONS</span>'
+
+# ── Build mismatch section HTML ───────────────────────────────────────────────
+def _build_mismatch_html(mismatch_data, mismatch_plots_b64):
+    if not mismatch_data:
+        return '<div class="card" id="mismatch"><h2>Mismatch Distribution</h2><p class="muted">Run m14_mismatch to generate mismatch data.</p></div>'
+    pop_order = ["SI", "NS", "CAI", "SB", "all"]
+    figs_html = ""
+    table_rows = ""
+    for pop in pop_order:
+        data = mismatch_data.get(pop)
+        if not data:
+            continue
+        if data.get("skipped"):
+            table_rows += f'<tr><td>{pop}</td><td>{data.get("n","—")}</td><td colspan="4" style="color:#999">Skipped — {data.get("reason","too few sequences")}</td></tr>'
+            continue
+        colour = data.get("colour", "#94a3b8")
+        r      = data.get("raggedness", 0)
+        ssd    = data.get("ssd", 0)
+        tau    = data.get("tau", 0)
+        n      = data.get("n", "—")
+        interp = "consistent with sudden expansion" if r < 0.02 else "suggests stable or structured population"
+        interp_col = "#22c55e" if r < 0.02 else "#f97316"
+        table_rows += (f'<tr><td><span style="color:{colour};font-weight:bold">{pop}</span></td>'
+                       f'<td>{n}</td><td>{tau:.3f}</td><td>{r:.5f}</td><td>{ssd:.5f}</td>'
+                       f'<td style="color:{interp_col};font-size:0.85em">{interp}</td></tr>')
+        if pop in mismatch_plots_b64:
+            figs_html += (f'<div style="margin-bottom:20px">'
+                          f'<img src="data:image/png;base64,{mismatch_plots_b64[pop]}" style="max-width:100%" /></div>')
+    return (f'<div class="card" id="mismatch"><h2>Mismatch Distribution — D-loop</h2>'
+            f'<p>Pairwise mismatch distributions computed from D-loop alignment per population. '
+            f'Rogers &amp; Harpending (1992) sudden expansion model fitted. '
+            f'Low raggedness r &lt; 0.02 is consistent with past sudden expansion.</p>'
+            f'<h3>Summary Statistics</h3><div class="table-wrap"><table>'
+            f'<thead><tr><th>Population</th><th>n</th><th>τ</th><th>r</th><th>SSD</th><th>Interpretation</th></tr></thead>'
+            f'<tbody>{table_rows}</tbody></table></div>'
+            f'<h3>Mismatch Plots</h3>{figs_html if figs_html else "No plots generated."}</div>')
+
+_mm_data   = mismatch_data   if "mismatch_data"   in dir() else {}
+_mm_plots  = mismatch_plots_b64 if "mismatch_plots_b64" in dir() else {}
+mismatch_section_html = _build_mismatch_html(_mm_data, _mm_plots)
 
 # ── Write HTML ────────────────────────────────────────────────────────────────
 print("Writing HTML...")
@@ -995,6 +1090,9 @@ html = f"""<!DOCTYPE html>
     full skyline plots with 95% HPD credible intervals.
   </p>''' if bsp_ess_table_rows else ''}
 </div>
+
+<!-- ── Mismatch Distribution ─────────────────────────────────────────────── -->
+{mismatch_section_html}
 
 <!-- ── Methods ──────────────────────────────────────────────────────────── -->
 <div class="card methods" id="methods">
@@ -1606,17 +1704,24 @@ if bsp_pop_data:
         pop_sizes = data["pop_sizes"]
         if not pop_sizes: continue
         n_groups = len(pop_sizes[0])
-        import numpy as np
-        ps_arr = np.array(pop_sizes)  # shape: (n_samples, n_groups)
+        ps_arr  = np.array(pop_sizes)  # shape: (n_samples, n_groups)
         medians = np.median(ps_arr, axis=0)
         lo95    = np.percentile(ps_arr, 2.5,  axis=0)
         hi95    = np.percentile(ps_arr, 97.5, axis=0)
         groups  = np.arange(1, n_groups + 1)
         colour  = POP_COLOURS.get(pop_label, "#607D8B")
         try:
+            from scipy.ndimage import gaussian_filter1d
+            # Smooth median line only (not HPD — keep HPD as raw posterior)
+            smooth_med = gaussian_filter1d(np.log10(np.maximum(medians, 1e-9)), sigma=1.5)
+            smooth_med = 10 ** smooth_med
             fig, ax = plt.subplots(figsize=(7, 4))
-            ax.fill_between(groups, lo95, hi95, alpha=0.25, color=colour)
-            ax.plot(groups, medians, color=colour, linewidth=2)
+            ax.fill_between(groups, lo95, hi95, alpha=0.20, color=colour,
+                            label="95% HPD")
+            ax.plot(groups, medians,    color=colour, linewidth=0.8,
+                    alpha=0.4, linestyle="--", label="Median (raw)")
+            ax.plot(groups, smooth_med, color=colour, linewidth=2.0,
+                    label="Median (smoothed)")
             ax.set_yscale("log")
             ax.set_xlabel("Coalescent interval (recent → ancient)", fontsize=10)
             ax.set_ylabel("Effective population size (Ne, log scale)", fontsize=10)
@@ -1625,7 +1730,10 @@ if bsp_pop_data:
             title_pop = "All samples" if pop_label == "all" else f"Population {pop_label}"
             n_label   = f" (n={n_samples})" if n_samples else ""
             ax.set_title(f"BSP — {title_pop}{n_label}", fontsize=11)
+            ax.legend(fontsize=8, loc="best")
             ax.tick_params(labelsize=9)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
             fig.tight_layout()
             bsp_plots_b64[pop_label] = encode_fig(fig)
             plt.close(fig)
